@@ -3,7 +3,7 @@ LABEL maintainer="benapeters"
 ARG shinyapp BIOC351_KD
 #~wimg 20240614 
 
-RUN R -q -e "install.packages(c())"
+RUN R -q -e "install.packages(c('shiny','rhandsontable','ggplot2','dplyr','tidyr','minpack.lm'))"
 
 RUN mkdir /opt/app
 COPY app.R /opt/app/
