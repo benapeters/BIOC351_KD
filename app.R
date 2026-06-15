@@ -92,6 +92,7 @@ ui <- fluidPage(
                    p(class = "note", "Column 1 = highest, Column 12 = lowest."),
                    hr(),
                    div(class = "section-title", "\ud83d\udcc8  Display"),
+                   radioButtons("x_scale", "X-Axis Scale:", choices = c("Linear", "Log10"), inline = TRUE),
                    checkboxInput("show_rep",   "Show individual replicates", value = TRUE),
                    checkboxInput("show_resid", "Show residual plot",         value = FALSE),
                    hr(),
@@ -101,22 +102,20 @@ ui <- fluidPage(
     ),
     
     mainPanel(width = 9,
-              # ── Concentration preview ──────────────────────────────────────────────
-              wellPanel(
-                div(class = "section-title", "Concentrations (µM) — auto-generated from dilution settings"),
-                verbatimTextOutput("conc_preview")
-              ),
               
               # ── Data entry table ───────────────────────────────────────────────────
               wellPanel(
                 div(class = "section-title", "Raw Absorbance Data"),
                 p(icon("paste"),
                   tags$strong("You can copy and paste your data directly from the plate reader software into the table below."),
-                  " Select the 8 x 12 block of values from your spreadsheet, click the top-left data cell (row A, column 1), and paste.",
+                  " Select the 8 x 12 block of values from your spreadsheet, click the top-left data cell (Row A, Col 1), and paste.",
                   style = "font-size:13px; color:#444; margin-bottom:8px;"),
                 p(class = "note", style = "margin-bottom:8px;",
                   "Layout: rows A, C, E, G = signal | rows B, D, F, H = blank. The 'Row' column is read-only."),
+                
+                # ── Output Table ──
                 rHandsontableOutput("hot_table"),
+                
                 br(),
                 p(class = "note",
                   icon("info-circle"),
@@ -141,27 +140,60 @@ server <- function(input, output, session) {
     input$start_conc / (input$fold ^ (0:11))
   })
   
-  output$conc_preview <- renderText({
-    cv <- round(conc_vec(), 6)
-    paste(sprintf("Col%2d: %s µM", 1:12, formatC(cv, format = "g", digits = 4)), collapse = "   ")
-  })
-  
-  # ── Reactive: rhandsontable ────────────────────────────────────────────────
+  # ── Reactive: rhandsontable data tracking ─────────────────────────────────
   rv <- reactiveVal(default_abs)
   
   output$hot_table <- renderRHandsontable({
-    rhandsontable(rv(),
+    df <- rv()
+    
+    # Generate the top Concentration row dynamically based on current inputs
+    conc_vals <- round(conc_vec(), 4)
+    conc_row <- data.frame(Row = "Conc", t(conc_vals), stringsAsFactors = FALSE)
+    colnames(conc_row) <- colnames(df)
+    
+    # Bind the concentration row to the top of the actual data
+    display_df <- rbind(conc_row, df)
+    
+    rhandsontable(display_df,
                   rowHeaders = NULL,
                   stretchH   = "all",
-                  height     = 240) %>%
-      hot_col("Row", readOnly = TRUE, width = 40) %>%
-      hot_cols(format = "0.0000") %>%
-      hot_table(highlightCol = TRUE, highlightRow = TRUE)
+                  height     = 275) %>%
+      # Custom JavaScript to format the grid. 
+      # Locks Row 0 (Concentrations) and applies distinct styling.
+      hot_cols(format = "0.0000", renderer = "
+        function(instance, td, row, col, prop, value, cellProperties) {
+          // Keep Column 0 as Text, others as Numeric
+          if (col === 0) {
+            Handsontable.renderers.TextRenderer.apply(this, arguments);
+          } else {
+            Handsontable.renderers.NumericRenderer.apply(this, arguments);
+          }
+          
+          // Lock and style the top 'Conc' row
+          if (row === 0) {
+            cellProperties.readOnly = true;
+            td.style.background = '#f1f5f9';
+            td.style.color = '#2c5f8a';
+            td.style.fontWeight = 'bold';
+          }
+          
+          // Keep the 'Row' column read-only as well
+          if (col === 0 && row > 0) {
+            cellProperties.readOnly = true;
+            td.style.background = '#f9f9f9';
+          }
+        }
+      ")
   })
   
   observe({
-    if (!is.null(input$hot_table))
-      rv(hot_to_r(input$hot_table))
+    if (!is.null(input$hot_table)) {
+      new_df <- hot_to_r(input$hot_table)
+      # Strip out the auto-generated Concentration row before saving back to rv()
+      # This ensures user data flows cleanly into the calculations without crashing
+      clean_df <- new_df[new_df$Row != "Conc", ]
+      rv(clean_df)
+    }
   })
   
   # ── Reactive: processed data (blank-subtracted, net signals) ──────────────
@@ -201,7 +233,6 @@ server <- function(input, output, session) {
   fits <- eventReactive(input$calc, {
     p <- processed()
     
-    # CHANGED: Fit Kd using individual replicates rather than the mean data
     list(
       novel = fit_kd(p$novel_rep$conc, p$novel_rep$net),
       ctrl  = fit_kd(p$ctrl_rep$conc,  p$ctrl_rep$net)
@@ -260,7 +291,11 @@ server <- function(input, output, session) {
     p <- processed()
     f <- fits()
     
-    x_seq <- seq(0, max(conc_vec()) * 1.05, length.out = 400)
+    if (input$x_scale == "Log10") {
+      x_seq <- exp(seq(log(min(conc_vec()) * 0.1), log(max(conc_vec()) * 1.5), length.out = 400))
+    } else {
+      x_seq <- seq(0, max(conc_vec()) * 1.05, length.out = 400)
+    }
     
     pred_df <- bind_rows(
       if (!is.null(f$novel)) data.frame(x = x_seq, y = predict(f$novel, newdata = list(x = x_seq)), Sample = "Novel Binding Protein") else NULL,
@@ -272,7 +307,6 @@ server <- function(input, output, session) {
       data.frame(p$ctrl_mean,  Sample = "Positive Control")
     )
     
-    # CHANGED: Added facet_wrap and removed legend
     g <- ggplot(mean_df, aes(x = conc, y = mean_net, colour = Sample, fill = Sample)) +
       geom_point(size = 3.5, shape = 16) +
       labs(x = "Concentration (µM)", y = "Net Absorbance (blank-subtracted)",
@@ -299,7 +333,6 @@ server <- function(input, output, session) {
     if (nrow(pred_df) > 0)
       g <- g + geom_line(data = pred_df, aes(x = x, y = y), linewidth = 1.1)
     
-    # CHANGED: Use a dataframe to add Kd lines securely within respective facets
     kd_df <- bind_rows(
       if (!is.null(f$novel)) data.frame(Sample = "Novel Binding Protein", kd = coef(f$novel)["Kd"]) else NULL,
       if (!is.null(f$ctrl))  data.frame(Sample = "Positive Control",      kd = coef(f$ctrl)["Kd"]) else NULL
@@ -314,6 +347,11 @@ server <- function(input, output, session) {
                    linetype = "dashed", alpha = 0.7, linewidth = 0.8) +
         geom_label(data = kd_df, aes(x = kd, y = y_pos, label = sprintf("Kd = %.3f µM", kd), colour = Sample),
                    fill = "white", label.size = 0.3, hjust = -0.08, size = 4.5, fontface = "bold", show.legend = FALSE)
+    }
+    
+    # Apply Log10 scale with non-scientific notation
+    if (input$x_scale == "Log10") {
+      g <- g + scale_x_log10(labels = function(x) format(x, scientific = FALSE))
     }
     
     g
@@ -332,7 +370,6 @@ server <- function(input, output, session) {
       ) else NULL
     )
     
-    # CHANGED: Added facet_wrap and removed legend
     ggplot(resid_df, aes(x = fitted, y = resid, colour = Sample)) +
       geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
       geom_point(size = 3) +
