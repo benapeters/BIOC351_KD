@@ -121,19 +121,74 @@ ui <- fluidPage(
                   icon("info-circle"),
                   " Blank subtraction is applied automatically: Net signal = signal row minus paired blank row.")
               ),
-              
-              # ── Results ───────────────────────────────────────────────────────────
-              uiOutput("results_panel"),
-              
+              # ── Raw Data QC Plot ──────────────────────────────────────────────────
+              wellPanel(
+                div(class = "section-title", "🔍 Raw Data Quality Control"),
+                p(class = "note", "Check for non-specific binding in the negative control rows before blank subtraction. Signal rows are solid; Blank rows are dashed."),
+                plotOutput("raw_plot", height = "350px")
+              ),
               # ── Plots ─────────────────────────────────────────────────────────────
-              uiOutput("plot_panel")
+              uiOutput("plot_panel"),
+              # ── Results ───────────────────────────────────────────────────────────
+              uiOutput("results_panel")
     )
   )
 )
 
 # ── Server ────────────────────────────────────────────────────────────────────
 server <- function(input, output, session) {
-  
+  # ── Raw Data Plot (Pre-subtraction) ───────────────────────────────────────
+  output$raw_plot <- renderPlot({
+    req(rv(), conc_vec())
+    df <- rv()
+    conc <- conc_vec()
+    
+    # Pivot the 12 columns into a long format for ggplot
+    raw_long <- df %>%
+      pivot_longer(cols = -Row, names_to = "Column", values_to = "Absorbance") %>%
+      mutate(Column = as.numeric(Column))
+    
+    # Map the dynamically calculated concentrations to the columns
+    conc_df <- data.frame(Column = 1:12, Concentration = conc)
+    raw_long <- raw_long %>% left_join(conc_df, by = "Column")
+    
+    # Categorize the rows into Signal/Blank, assign Sample type, and group by Pair
+    raw_long <- raw_long %>%
+      mutate(
+        Type = ifelse(Row %in% c("A", "C", "E", "G"), "Signal", "Blank"),
+        Sample = ifelse(Row %in% c("A", "B", "C", "D"), "Novel Binding Protein", "Positive Control"),
+        Pair = case_when(
+          Row %in% c("A", "B") ~ "Novel Protein - Rep 1 (Rows A & B)",
+          Row %in% c("C", "D") ~ "Novel Protein - Rep 2 (Rows C & D)",
+          Row %in% c("E", "F") ~ "Positive Control - Rep 1 (Rows E & F)",
+          Row %in% c("G", "H") ~ "Positive Control - Rep 2 (Rows G & H)"
+        )
+      )
+    
+    g_raw <- ggplot(raw_long, aes(x = Concentration, y = Absorbance, color = Sample, linetype = Type)) +
+      geom_point(size = 2.5) +
+      geom_line(linewidth = 1) +
+      facet_wrap(~ Pair, ncol = 2) +
+      scale_linetype_manual(values = c("Signal" = "solid", "Blank" = "dashed"), name = "Row Type") +
+      # Use identical colors to the fit plot and suppress the redundant legend
+      scale_color_manual(
+        values = c("Novel Binding Protein" = "#2c8adf", "Positive Control" = "#2ca02c"), 
+        guide = "none"
+      ) +
+      labs(x = "Concentration (µM)", y = "Raw Absorbance (OD)",
+           title = "Raw Binding vs. Negative Control Background") +
+      theme_bw(base_size = 13) +
+      theme(panel.grid.minor = element_blank(),
+            plot.title = element_text(face = "bold", colour = "#1a3a5c"),
+            legend.position = "right")
+    
+    # Apply Log10 scale with non-scientific notation if selected
+    if (input$x_scale == "Log10") {
+      g_raw <- g_raw + scale_x_log10(labels = function(x) format(x, scientific = FALSE))
+    }
+    
+    g_raw
+  })
   # ── Reactive: concentration vector ────────────────────────────────────────
   conc_vec <- reactive({
     req(input$start_conc, input$fold)
@@ -215,9 +270,9 @@ server <- function(input, output, session) {
       data.frame(rep = "Rep 1", conc = conc, net = get_row("E") - get_row("F")),
       data.frame(rep = "Rep 2", conc = conc, net = get_row("G") - get_row("H"))
     )
-    # Clamp negatives to 0 (below-blank artefacts)
-    novel_net$net <- pmax(novel_net$net, 0)
-    ctrl_net$net  <- pmax(ctrl_net$net,  0)
+    # Clamp negatives to 0 (below-blank artefacts) Removed this clamping as negative values were not showing and therefore causing nonspecific binders to show as very low Kd's
+    #novel_net$net <- pmax(novel_net$net, 0)
+    #ctrl_net$net  <- pmax(ctrl_net$net,  0)
     
     # Mean per concentration
     novel_mean <- novel_net %>% group_by(conc) %>% summarise(mean_net = mean(net), .groups="drop")
@@ -308,6 +363,7 @@ server <- function(input, output, session) {
     )
     
     g <- ggplot(mean_df, aes(x = conc, y = mean_net, colour = Sample, fill = Sample)) +
+      geom_hline(yintercept = 0, linetype = "solid", colour = "grey75", linewidth = 1) +
       geom_point(size = 3.5, shape = 16) +
       labs(x = "Concentration (µM)", y = "Net Absorbance (blank-subtracted)",
            title = "One-Site Specific Binding Fit") +
