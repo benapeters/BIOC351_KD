@@ -134,10 +134,41 @@ app_css <- "
   .nav-row { display: flex; gap: 10px; align-items: center; margin: 10px 0 30px; }
   .reading-guide { font-size: 13px; color: #444; background: #f1f5f9; border-radius: 6px;
                    padding: 8px 14px; margin-top: 8px; }
+
+  /* read-only summary of the student's answers (Results step) */
+  .answer-block { margin-bottom: 12px; }
+  .answer-prompt { font-size: 12px; color: #777; margin-bottom: 4px; }
+  .answer-text { white-space: pre-wrap; background: #f9fbfd; border: 1px solid #dde3ea;
+                 border-radius: 6px; padding: 8px 12px; font-size: 14px; color: #222; }
+
+  /* print / save-as-PDF layout */
+  @media print {
+    #sidebar_col, .progress-steps, .nav-row, .no-print { display: none !important; }
+    #main_col { width: 100% !important; float: none !important; }
+    body { background: #fff !important; }
+    .well { break-inside: avoid; border: none !important; padding: 4px 0 !important; }
+    .question-card, .result-box, .answer-block { break-inside: avoid; }
+    img { max-width: 100% !important; }
+    * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
 "
 
 app_js <- "
   Shiny.addCustomMessageHandler('scrollTop', function(x) { window.scrollTo(0, 0); });
+
+  // Make textareas as tall as their content while printing, then restore them.
+  window.addEventListener('beforeprint', function() {
+    document.querySelectorAll('textarea').forEach(function(t) {
+      t.dataset.prevHeight = t.style.height;
+      t.style.height = 'auto';
+      t.style.height = t.scrollHeight + 'px';
+    });
+  });
+  window.addEventListener('afterprint', function() {
+    document.querySelectorAll('textarea').forEach(function(t) {
+      t.style.height = t.dataset.prevHeight || '';
+    });
+  });
 "
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -159,14 +190,33 @@ ui <- fluidPage(
     div(class = "col-sm-3", id = "sidebar_col",
         wellPanel(
           div(class = "section-title", "\u2699\ufe0f  Dilution Series"),
-          numericInput("start_conc", "Highest concentration (µM):", value = 10, min = 0, step = 0.1),
-          numericInput("fold",       "Fold dilution:",               value = 2,  min = 1.01, step = 0.5),
+          numericInput("start_conc_novel", "Novel binding protein: highest concentration (µM):",
+                       value = 10, min = 0, step = 0.1),
+          numericInput("start_conc_ctrl",  "Positive control: highest concentration (µM):",
+                       value = 10, min = 0, step = 0.1),
+          numericInput("fold", "Fold dilution (both samples):", value = 2, min = 1.01, step = 0.5),
           p(class = "note", "Column 1 = highest, Column 12 = lowest."),
           hr(),
           div(class = "section-title", "\ud83d\udcc8  Display"),
           radioButtons("x_scale", "X-Axis Scale:", choices = c("Linear", "Log10"), inline = TRUE),
-          checkboxInput("show_rep",   "Show individual replicates", value = TRUE),
-          checkboxInput("show_resid", "Show residual plot",         value = FALSE)
+          # These two only affect the Results step, so only show them there.
+          # (conditionalPanel keeps the inputs in the DOM, so values are preserved.)
+          conditionalPanel(
+            condition = "output.step_num == 4",
+            checkboxInput("show_rep",   "Show individual replicates", value = TRUE),
+            checkboxInput("show_resid", "Show residual plot",         value = FALSE)
+          ),
+          conditionalPanel(
+            condition = "output.step_num == 4",
+            hr(),
+            div(class = "section-title", "\ud83d\udcbe  Save"),
+            tags$button(type = "button", class = "btn btn-default btn-block",
+                        onclick = "window.print()",
+                        icon("file-pdf"), " Save as PDF"),
+            p(class = "note", style = "margin-top:6px;",
+              "In the print window that opens, set the destination to 'Save as PDF'."),
+            downloadButton("dl_png", "Save graph as PNG", class = "btn-block")
+          )
         )
     ),
     div(class = "col-sm-9", id = "main_col",
@@ -193,10 +243,16 @@ server <- function(input, output, session) {
       list(pred_novel = NA_real_, pred_ctrl = NA_real_))
   )
   
-  conc_vec <- reactive({
-    req(input$start_conc, input$fold)
-    req(input$start_conc > 0, input$fold > 1)
-    input$start_conc / (input$fold ^ (0:11))
+  # One dilution series per sample (same fold dilution, different starting concentration)
+  conc_novel <- reactive({
+    req(input$start_conc_novel, input$fold)
+    req(input$start_conc_novel > 0, input$fold > 1)
+    input$start_conc_novel / (input$fold ^ (0:11))
+  })
+  conc_ctrl <- reactive({
+    req(input$start_conc_ctrl, input$fold)
+    req(input$start_conc_ctrl > 0, input$fold > 1)
+    input$start_conc_ctrl / (input$fold ^ (0:11))
   })
   
   # Is the plate data complete and numeric?
@@ -230,6 +286,10 @@ server <- function(input, output, session) {
   observeEvent(input$back_3,     current_step(3))
   
   observeEvent(current_step(), session$sendCustomMessage("scrollTop", TRUE))
+  
+  # Used by the sidebar's conditionalPanels (must keep running while hidden)
+  output$step_num <- renderText(current_step())
+  outputOptions(output, "step_num", suspendWhenHidden = FALSE)
   
   output$layout_css <- renderUI({
     if (current_step() == 1)
@@ -375,7 +435,7 @@ server <- function(input, output, session) {
           " Select the 8 x 12 block of values from your spreadsheet, click the top-left data cell (Row A, Col 1), and paste.",
           style = "font-size:13px; color:#444; margin-bottom:8px;"),
         p(class = "note", style = "margin-bottom:8px;",
-          "Layout: rows A, C, E, G = signal | rows B, D, F, H = blank. The 'Row' column and the 'Conc' row are read-only.",
+          "Layout: rows A, C, E, G = signal | rows B, D, F, H = blank. The 'Row' column and the two 'Conc' rows (rows A-D use the novel protein series, rows E-H the positive control series) are read-only.",
           " Set your dilution series in the panel on the left."),
         rHandsontableOutput("hot_table"),
         uiOutput("data_msg")
@@ -400,15 +460,16 @@ server <- function(input, output, session) {
   output$hot_table <- renderRHandsontable({
     df <- isolate(rv())   # isolate: only re-render when concentrations change, not on every edit
     
-    conc_vals <- round(conc_vec(), 4)
-    conc_row  <- data.frame(Row = "Conc", t(conc_vals), stringsAsFactors = FALSE)
-    colnames(conc_row) <- colnames(df)
-    display_df <- rbind(conc_row, df)
+    conc_row_novel <- data.frame(Row = "Conc (Novel)", t(round(conc_novel(), 4)), stringsAsFactors = FALSE)
+    conc_row_ctrl  <- data.frame(Row = "Conc (Control)", t(round(conc_ctrl(), 4)), stringsAsFactors = FALSE)
+    colnames(conc_row_novel) <- colnames(df)
+    colnames(conc_row_ctrl)  <- colnames(df)
+    display_df <- rbind(conc_row_novel, conc_row_ctrl, df)
     
     rhandsontable(display_df,
                   rowHeaders = NULL,
                   stretchH   = "all",
-                  height     = 275) %>%
+                  height     = 300) %>%
       hot_cols(format = "0.0000", renderer = "
         function(instance, td, row, col, prop, value, cellProperties) {
           if (col === 0) {
@@ -416,13 +477,13 @@ server <- function(input, output, session) {
           } else {
             Handsontable.renderers.NumericRenderer.apply(this, arguments);
           }
-          if (row === 0) {
+          if (row <= 1) {
             cellProperties.readOnly = true;
             td.style.background = '#f1f5f9';
             td.style.color = '#2c5f8a';
             td.style.fontWeight = 'bold';
           }
-          if (col === 0 && row > 0) {
+          if (col === 0 && row > 1) {
             cellProperties.readOnly = true;
             td.style.background = '#f9f9f9';
           }
@@ -432,7 +493,7 @@ server <- function(input, output, session) {
   
   observeEvent(input$hot_table, {
     new_df   <- hot_to_r(input$hot_table)
-    clean_df <- new_df[new_df$Row != "Conc", ]
+    clean_df <- new_df[!grepl("^Conc", new_df$Row), ]
     rv(clean_df)
   })
   
@@ -454,19 +515,13 @@ server <- function(input, output, session) {
   
   # ── Raw data plot (pre-subtraction) ───────────────────────────────────────
   raw_plot_obj <- reactive({
-    req(data_ok(), conc_vec())
-    df   <- rv()
-    conc <- conc_vec()
+    req(data_ok(), conc_novel(), conc_ctrl())
+    df <- rv()
     
     raw_long <- df %>%
       pivot_longer(cols = -Row, names_to = "Column", values_to = "Absorbance") %>%
-      mutate(Column = as.numeric(Column))
-    
-    conc_df  <- data.frame(Column = 1:12, Concentration = conc)
-    raw_long <- raw_long %>% left_join(conc_df, by = "Column")
-    
-    raw_long <- raw_long %>%
       mutate(
+        Column = as.numeric(Column),
         Type   = ifelse(Row %in% c("A", "C", "E", "G"), "Signal", "Blank"),
         Sample = ifelse(Row %in% c("A", "B", "C", "D"), "Novel Binding Protein", "Positive Control"),
         Pair   = case_when(
@@ -477,10 +532,17 @@ server <- function(input, output, session) {
         )
       )
     
+    # Each sample has its own concentration series
+    conc_df <- bind_rows(
+      data.frame(Column = 1:12, Sample = "Novel Binding Protein", Concentration = conc_novel()),
+      data.frame(Column = 1:12, Sample = "Positive Control",      Concentration = conc_ctrl())
+    )
+    raw_long <- raw_long %>% left_join(conc_df, by = c("Column", "Sample"))
+    
     g_raw <- ggplot(raw_long, aes(x = Concentration, y = Absorbance, color = Sample, linetype = Type)) +
       geom_point(size = 2.5) +
       geom_line(linewidth = 1) +
-      facet_wrap(~ Pair, ncol = 2) +
+      facet_wrap(~ Pair, ncol = 2, scales = "free_x") +
       scale_linetype_manual(values = c("Signal" = "solid", "Blank" = "dashed"), name = "Row Type") +
       scale_color_manual(
         values = c("Novel Binding Protein" = "#2c8adf", "Positive Control" = "#2ca02c"),
@@ -501,6 +563,7 @@ server <- function(input, output, session) {
   
   output$raw_plot_s2 <- renderPlot(raw_plot_obj())
   output$raw_plot_s3 <- renderPlot(raw_plot_obj())
+  output$raw_plot_s4 <- renderPlot(raw_plot_obj())
   
   # ──────────────────────────────────────────────────────────────────────────
   #  STEP 3: Interpret your data (the gate)
@@ -578,6 +641,7 @@ server <- function(input, output, session) {
         plotOutput("binding_plot", height = "380px"),
         uiOutput("resid_ui")
       ),
+      uiOutput("interpretation"),
       wellPanel(
         div(class = "section-title", "\ud83e\udde0 Reflect"),
         p(class = "note", "These reflection boxes are optional and are not saved or sent anywhere. Copy your text somewhere if you want to keep it."),
@@ -601,18 +665,19 @@ server <- function(input, output, session) {
   # ── Processed data (blank-subtracted, net signals) ────────────────────────
   processed <- reactive({
     req(current_step() == 4, all_answered(), data_ok())
-    df   <- rv()
-    conc <- conc_vec()
+    df <- rv()
+    cn <- conc_novel()
+    cc <- conc_ctrl()
     
     get_row <- function(row_label) as.numeric(df[df$Row == row_label, as.character(1:12)])
     
     novel_net <- rbind(
-      data.frame(rep = "Rep 1", conc = conc, net = get_row("A") - get_row("B")),
-      data.frame(rep = "Rep 2", conc = conc, net = get_row("C") - get_row("D"))
+      data.frame(rep = "Rep 1", conc = cn, net = get_row("A") - get_row("B")),
+      data.frame(rep = "Rep 2", conc = cn, net = get_row("C") - get_row("D"))
     )
     ctrl_net <- rbind(
-      data.frame(rep = "Rep 1", conc = conc, net = get_row("E") - get_row("F")),
-      data.frame(rep = "Rep 2", conc = conc, net = get_row("G") - get_row("H"))
+      data.frame(rep = "Rep 1", conc = cc, net = get_row("E") - get_row("F")),
+      data.frame(rep = "Rep 2", conc = cc, net = get_row("G") - get_row("H"))
     )
     # NOTE: negatives are deliberately NOT clamped to 0, so non-specific binders
     # don't appear to have artificially low Kd values.
@@ -696,21 +761,48 @@ server <- function(input, output, session) {
     )
   })
   
+  # ── Read-only summary of the student's Step 3 work (included when printing) ──
+  output$interpretation <- renderUI({
+    show <- function(title, prompt, text) {
+      div(class = "answer-block",
+          div(class = "q-title", title),
+          if (!is.null(prompt)) div(class = "answer-prompt", prompt),
+          div(class = "answer-text", if (nzchar(trimws(text))) text else "(no response)"))
+    }
+    
+    qs <- lapply(questions, function(q) show(q$title, q$text, answers[[q$id]]))
+    
+    wellPanel(
+      div(class = "section-title", "\ud83d\udcdd Your interpretation (from Step 3)"),
+      plotOutput("raw_plot_s4", height = "340px"),
+      br(),
+      qs,
+      div(class = "answer-block",
+          div(class = "q-title", "Half-maximal concentration estimate"),
+          div(class = "answer-prompt",
+              sprintf("Novel binding protein: %.3f µM   |   Positive control: %.3f µM",
+                      answers$pred_novel, answers$pred_ctrl)),
+          div(class = "answer-text", answers$q5))
+    )
+  })
+  
   # ── Binding plot ──────────────────────────────────────────────────────────
-  output$binding_plot <- renderPlot({
+  binding_plot_obj <- reactive({
     req(processed(), fits())
     p <- processed()
     f <- fits()
     
-    if (input$x_scale == "Log10") {
-      x_seq <- exp(seq(log(min(conc_vec()) * 0.1), log(max(conc_vec()) * 1.5), length.out = 400))
-    } else {
-      x_seq <- seq(0, max(conc_vec()) * 1.05, length.out = 400)
+    # Smooth x-values for the fitted curve, spanning each sample's own concentration range
+    make_x <- function(conc) {
+      if (input$x_scale == "Log10") exp(seq(log(min(conc) * 0.1), log(max(conc) * 1.5), length.out = 400))
+      else                          seq(0, max(conc) * 1.05, length.out = 400)
     }
+    x_novel <- make_x(conc_novel())
+    x_ctrl  <- make_x(conc_ctrl())
     
     pred_df <- bind_rows(
-      if (!is.null(f$novel)) data.frame(x = x_seq, y = predict(f$novel, newdata = list(x = x_seq)), Sample = "Novel Binding Protein") else NULL,
-      if (!is.null(f$ctrl))  data.frame(x = x_seq, y = predict(f$ctrl,  newdata = list(x = x_seq)), Sample = "Positive Control") else NULL
+      if (!is.null(f$novel)) data.frame(x = x_novel, y = predict(f$novel, newdata = list(x = x_novel)), Sample = "Novel Binding Protein") else NULL,
+      if (!is.null(f$ctrl))  data.frame(x = x_ctrl,  y = predict(f$ctrl,  newdata = list(x = x_ctrl)),  Sample = "Positive Control") else NULL
     )
     
     mean_df <- bind_rows(
@@ -727,7 +819,7 @@ server <- function(input, output, session) {
                                      "Positive Control"      = "#2ca02c")) +
       scale_fill_manual(  values = c("Novel Binding Protein" = "#2c8adf44",
                                      "Positive Control"      = "#2ca02c44")) +
-      facet_wrap(~ Sample) +
+      facet_wrap(~ Sample, scales = "free_x") +
       theme_bw(base_size = 13) +
       theme(legend.position = "none",
             panel.grid.minor = element_blank(),
@@ -765,6 +857,17 @@ server <- function(input, output, session) {
     
     g
   })
+  
+  output$binding_plot <- renderPlot(binding_plot_obj())
+  
+  # ── Save the binding plot as a high-resolution PNG
+  output$dl_png <- downloadHandler(
+    filename = function() sprintf("kd_binding_curves_%s.png", format(Sys.Date(), "%Y%m%d")),
+    content  = function(file) {
+      ggsave(file, plot = binding_plot_obj(), width = 10, height = 5.5,
+             units = "in", dpi = 300, bg = "white")
+    }
+  )
   
   # ── Residual plot (toggle lives in its own uiOutput so the step doesn't re-render)
   output$resid_ui <- renderUI({
